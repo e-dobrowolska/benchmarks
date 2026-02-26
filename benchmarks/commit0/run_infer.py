@@ -14,6 +14,7 @@ from benchmarks.commit0.build_images import (
 )
 from benchmarks.commit0.config import INFER_DEFAULTS
 from benchmarks.utils.args_parser import get_parser
+from benchmarks.utils.console_logging import summarize_instance
 from benchmarks.utils.constants import EVAL_AGENT_SERVER_IMAGE
 from benchmarks.utils.conversation import build_event_persistence_callback
 from benchmarks.utils.critics import create_critic
@@ -24,14 +25,16 @@ from benchmarks.utils.evaluation_utils import (
     get_default_on_result_writer,
 )
 from benchmarks.utils.image_utils import image_exists
+from benchmarks.utils.llm_config import load_llm_config
 from benchmarks.utils.models import (
     EvalInstance,
     EvalMetadata,
     EvalOutput,
 )
 from benchmarks.utils.version import SDK_SHORT_SHA
-from openhands.sdk import LLM, Agent, Conversation, get_logger
+from openhands.sdk import Agent, Conversation, Tool, get_logger
 from openhands.sdk.workspace import RemoteWorkspace
+from openhands.tools.delegate import DelegateTool
 from openhands.tools.preset.default import get_default_tools
 from openhands.workspace import APIRemoteWorkspace, DockerDevWorkspace
 
@@ -238,8 +241,10 @@ class Commit0Evaluation(Evaluation):
             )
 
         # Clone the repository to the specific directory
+        # Use --depth 1 for shallow clone to prevent agents from accessing git history
+        # and exploiting it to retrieve original implementations (reward hacking prevention)
         workspace_dir_name = instance.data["repo"].split("/")[1]
-        clone_cmd = f"cd /workspace/ && git clone -b commit0_combined https://github.com/{instance.data['repo']}.git {workspace_dir_name}"
+        clone_cmd = f"cd /workspace/ && git clone --depth 1 -b commit0_combined https://github.com/{instance.data['repo']}.git {workspace_dir_name}"
         res = workspace.execute_command(clone_cmd, timeout=600)
         if res.exit_code != 0:
             raise RuntimeError(f"Failed to clone repo: {res.stderr}")
@@ -298,6 +303,8 @@ class Commit0Evaluation(Evaluation):
         repo_path = f"/workspace/{workspace_dir_name}"
 
         tools = get_default_tools(enable_browser=False)
+        if self.metadata.enable_delegation:
+            tools.append(Tool(name=DelegateTool.name))
         agent = Agent(
             llm=self.metadata.llm,
             tools=tools,
@@ -507,6 +514,14 @@ class Commit0Evaluation(Evaluation):
         # Final debug log
         logger.info(f"Final eval_result: {eval_result}")
 
+        # Log instance summary
+        summarize_instance(
+            instance_id=instance.id,
+            conversation=conversation,
+            git_patch=git_patch or "",
+            logger=logger,
+        )
+
         # Save workspace as zip (if supported by workspace implementation)
         zip_dest = os.path.join(
             self.metadata.eval_output_dir, "repos", repo_name, f"{repo_name}.zip"
@@ -605,12 +620,7 @@ def main() -> None:
     if args.max_attempts < 1:
         raise ValueError(f"max_attempts must be >= 1, got {args.max_attempts}")
 
-    llm_config_path = args.llm_config_path
-    if not os.path.isfile(llm_config_path):
-        raise ValueError(f"LLM config file {llm_config_path} does not exist")
-    with open(llm_config_path, "r") as f:
-        llm_config = f.read()
-    llm = LLM.model_validate_json(llm_config)
+    llm = load_llm_config(args.llm_config_path)
     logger.info("Using LLM config: %s", llm.model_dump_json(indent=2))
 
     dataset_description = (
@@ -640,6 +650,7 @@ def main() -> None:
         selected_instances_file=args.select,
         max_retries=args.max_retries,
         workspace_type=args.workspace,
+        enable_delegation=args.enable_delegation,
     )
 
     evaluator = Commit0Evaluation(
